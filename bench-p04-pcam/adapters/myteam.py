@@ -74,9 +74,10 @@ class Engine(Adapter):
         self._steps = max(40, int(_OPT_STEPS / scale))
         self._nrand = max(2,  int(_N_RAND    / scale))
 
-        # Precompute all per-attractor quantities in one pass
+        # Precompute all per-attractor quantities in one pass.
+        # _precompute_aniso also fills self._geo_diag to avoid recomputing H.
+        self._geo_diag = np.zeros((self.K, self.N))
         self._equil, self._aniso_pi = self._precompute_aniso()
-        self._geo_diag               = self._precompute_geo()          # (K, N)
         self._local_cov              = self._precompute_local_cov()    # (K, N)
 
         # Spectral smoother shared across retrieval calls
@@ -191,14 +192,19 @@ class Engine(Adapter):
 
             H = self._hessian(a_star)
             ev, evec = np.linalg.eigh(H)
-            if ev.min() <= 0:
-                continue
-
             ev_c      = np.maximum(ev, 1e-8)
             diag_Hinv = (evec ** 2 / ev_c).sum(axis=1)  # diag(H^{-1})
-            v_min     = evec[:, 0]
-            v_max     = evec[:, -1]
-            h_diag    = np.diag(H)
+
+            # Cache geo_diag for retrieval (always, even for non-PD H).
+            self._geo_diag[k] = diag_Hinv
+
+            if ev.min() <= 0:
+                # Non-PD H: skip mirror descent but geo_diag is still usable.
+                continue
+
+            v_min  = evec[:, 0]
+            v_max  = evec[:, -1]
+            h_diag = np.diag(H)
 
             inits: list[np.ndarray] = []
             for _ in range(self._nrand):
@@ -220,23 +226,10 @@ class Engine(Adapter):
 
             aniso_pi[k] = best_pi
 
+        # Row-normalise geo_diag so values are relative across dims (mean=1).
+        self._geo_diag /= (self._geo_diag.mean(axis=1, keepdims=True) + 1e-12)
+
         return equil, aniso_pi
-
-    def _precompute_geo(self) -> np.ndarray:
-        """diag(H^{-1}(a*)) per attractor, row-mean-normalised.
-
-        Larger values = larger local curvature inverse = dimension where
-        the energy surface is flatter = precision should be higher to
-        speed up convergence in that direction.
-        """
-        geo = np.zeros((self.K, self.N))
-        for k in range(self.K):
-            H = self._hessian(self._equil[k])
-            ev, evec = np.linalg.eigh(H)
-            ev_c   = np.maximum(ev, 1e-8)
-            geo[k] = (evec ** 2 / ev_c).sum(axis=1)
-        geo /= (geo.mean(axis=1, keepdims=True) + 1e-12)
-        return geo
 
     def _precompute_local_cov(self) -> np.ndarray:
         """Per-dimension variance within each pattern's cluster neighborhood.
